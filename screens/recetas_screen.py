@@ -1,0 +1,367 @@
+import os
+import shutil
+import uuid
+
+from kivy.metrics import dp
+from kivymd.uix.fitimage import FitImage
+from kivymd.uix.screen import MDScreen
+from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.scrollview import MDScrollView
+from kivymd.uix.button import MDRaisedButton, MDFlatButton, MDIconButton
+from kivymd.uix.label import MDLabel
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.menu import MDDropdownMenu
+from kivymd.uix.filemanager import MDFileManager
+
+from lib import storage
+
+
+IMAGENES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "images"
+)
+
+
+class RecetasScreen(MDScreen):
+    def __init__(self, **kwargs):
+        super().__init__(name="mis_recetas", md_bg_color=(0.08, 0.08, 0.1, 1), **kwargs)
+        self.modo = "insumos"
+        self.dialog = None
+        self.insumos_dialog = None
+        self.menu = None
+        self._insumo_editando = None
+        self._plato_editando = None
+        self._insumo_seleccionado = None
+        self._imagen_seleccionada = None
+        self.file_manager = None
+
+        root = MDBoxLayout(orientation="vertical", padding=dp(24), spacing=dp(14))
+
+        back = MDRaisedButton(text="‹  Volver al inicio", size_hint_y=None, height=dp(48))
+        back.bind(on_release=lambda *_: setattr(self.manager, "current", "inicio"))
+        root.add_widget(back)
+
+        root.add_widget(
+            MDLabel(text="Mis Recetas", font_style="H4", bold=True, size_hint_y=None, height=dp(52),
+                    theme_text_color="Custom", text_color=(1, 1, 1, 1))
+        )
+
+        tabs = MDBoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        self.btn_insumos = MDFlatButton(text="INSUMOS", on_release=lambda x: self.cambiar_modo("insumos"))
+        self.btn_platos = MDFlatButton(text="PLATOS", on_release=lambda x: self.cambiar_modo("platos"))
+        tabs.add_widget(self.btn_insumos)
+        tabs.add_widget(self.btn_platos)
+        root.add_widget(tabs)
+
+        scroll = MDScrollView()
+        self.container = MDBoxLayout(orientation="vertical", spacing=dp(6), size_hint_y=None)
+        self.container.bind(minimum_height=self.container.setter("height"))
+        scroll.add_widget(self.container)
+        root.add_widget(scroll)
+
+        agregar_btn = MDRaisedButton(text="+ Agregar", size_hint_y=None, height=dp(48))
+        agregar_btn.bind(on_release=lambda x: self.abrir_dialogo())
+        root.add_widget(agregar_btn)
+
+        self.add_widget(root)
+        self._marcar_tab_activo()
+
+    def on_pre_enter(self, *args):
+        self.refrescar()
+
+    def _marcar_tab_activo(self):
+        activo = (0.2, 0.6, 1, 1)
+        inactivo = (0.6, 0.6, 0.6, 1)
+        self.btn_insumos.theme_text_color = "Custom"
+        self.btn_platos.theme_text_color = "Custom"
+        self.btn_insumos.text_color = activo if self.modo == "insumos" else inactivo
+        self.btn_platos.text_color = activo if self.modo == "platos" else inactivo
+
+    def cambiar_modo(self, modo):
+        self.modo = modo
+        self._marcar_tab_activo()
+        self.refrescar()
+
+    def refrescar(self):
+        self.container.clear_widgets()
+        if self.modo == "insumos":
+            for insumo in storage.get_insumos():
+                texto = (
+                    f"{insumo['nombre']} — ${insumo['precio']:.0f} / {insumo['unidad']} "
+                    f"(merma {insumo['merma_pct'] * 100:.0f}%)"
+                )
+                self.container.add_widget(self._fila(texto, lambda i=insumo: self.abrir_dialogo(i)))
+        else:
+            from lib.calculo_costos import costo_real_plato, margen
+            for plato in storage.get_platos():
+                usados = storage.get_insumos_de_plato(plato["id"])
+                costo = costo_real_plato(usados, plato["mano_obra"])
+                m = margen(plato["precio_venta"], costo)
+                texto = (
+                    f"{plato['nombre']} — venta ${plato['precio_venta']:.0f} "
+                    f"/ costo ${costo:.0f} / margen {m:.1f}%"
+                )
+                self.container.add_widget(
+                    self._fila(texto, lambda p=plato: self.abrir_dialogo(p), imagen=plato.get("imagen"))
+                )
+
+    def _fila(self, texto, on_tap, imagen=None):
+        fila = MDBoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(8))
+        if imagen and os.path.exists(imagen):
+            fila.add_widget(FitImage(source=imagen, size_hint=(None, None), size=(dp(40), dp(40)), radius=[dp(6)]))
+        lbl = MDLabel(text=texto, theme_text_color="Custom", text_color=(0.9, 0.9, 0.9, 1))
+        fila.add_widget(lbl)
+        btn = MDIconButton(icon="pencil", theme_icon_color="Custom", icon_color=(0.6, 0.6, 0.6, 1))
+        btn.bind(on_release=lambda x: on_tap())
+        fila.add_widget(btn)
+        return fila
+
+
+    def abrir_dialogo(self, item=None):
+        if self.modo == "insumos":
+            self._abrir_dialogo_insumo(item)
+        else:
+            self._abrir_dialogo_plato(item)
+
+    def _abrir_dialogo_insumo(self, insumo=None):
+        self._insumo_editando = insumo
+        self.nombre_field = MDTextField(hint_text="Nombre", text=insumo["nombre"] if insumo else "")
+        self.unidad_field = MDTextField(hint_text="Unidad (kg / lt / un)", text=insumo["unidad"] if insumo else "")
+        self.precio_field = MDTextField(
+            hint_text="Precio de compra", text=str(insumo["precio"]) if insumo else "", input_filter="float"
+        )
+        self.merma_field = MDTextField(
+            hint_text="Merma % (ej: 5)",
+            text=str(insumo["merma_pct"] * 100) if insumo else "0",
+            input_filter="float",
+        )
+        content = MDBoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None, height=dp(220))
+        for f in (self.nombre_field, self.unidad_field, self.precio_field, self.merma_field):
+            content.add_widget(f)
+
+        botones = [
+            MDFlatButton(text="CANCELAR", on_release=lambda x: self.dialog.dismiss()),
+            MDRaisedButton(text="GUARDAR", on_release=lambda x: self._guardar_insumo()),
+        ]
+        if insumo:
+            botones.insert(0, MDFlatButton(
+                text="ELIMINAR", theme_text_color="Custom", text_color=(0.83, 0.24, 0.24, 1),
+                on_release=lambda x: self._eliminar_insumo(insumo["id"]),
+            ))
+
+        self.dialog = MDDialog(
+            title="Editar insumo" if insumo else "Nuevo insumo",
+            type="custom", content_cls=content, buttons=botones,
+        )
+        self.dialog.open()
+
+    def _guardar_insumo(self):
+        nombre = self.nombre_field.text.strip()
+        unidad = self.unidad_field.text.strip()
+        try:
+            precio = float(self.precio_field.text or 0)
+            merma_pct = float(self.merma_field.text or 0) / 100
+        except ValueError:
+            return
+        if not nombre or not unidad:
+            return
+        if self._insumo_editando:
+            storage.update_insumo(self._insumo_editando["id"], nombre, unidad, precio, merma_pct)
+        else:
+            storage.add_insumo(nombre, unidad, precio, merma_pct)
+        self.dialog.dismiss()
+        self.refrescar()
+
+    def _eliminar_insumo(self, insumo_id):
+        storage.delete_insumo(insumo_id)
+        self.dialog.dismiss()
+        self.refrescar()
+
+    def _abrir_dialogo_plato(self, plato=None):
+        self._plato_editando = plato
+        self._imagen_seleccionada = plato["imagen"] if plato else None
+
+        self.nombre_field = MDTextField(hint_text="Nombre del plato", text=plato["nombre"] if plato else "")
+        self.precio_field = MDTextField(
+            hint_text="Precio de venta", text=str(plato["precio_venta"]) if plato else "", input_filter="float"
+        )
+        self.mano_obra_field = MDTextField(
+            hint_text="Costo mano de obra", text=str(plato["mano_obra"]) if plato else "0", input_filter="float"
+        )
+
+        self.preview_imagen = FitImage(
+            source=self._imagen_seleccionada if self._imagen_seleccionada else "",
+            size_hint_y=None, height=dp(90), radius=[dp(8)],
+        )
+        elegir_foto_btn = MDFlatButton(text="Elegir foto", on_release=lambda x: self._abrir_selector_imagen())
+
+        content = MDBoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None, height=dp(320))
+        content.add_widget(self.preview_imagen)
+        content.add_widget(elegir_foto_btn)
+        for f in (self.nombre_field, self.precio_field, self.mano_obra_field):
+            content.add_widget(f)
+
+        botones = [
+            MDFlatButton(text="CANCELAR", on_release=lambda x: self.dialog.dismiss()),
+            MDRaisedButton(text="GUARDAR", on_release=lambda x: self._guardar_plato()),
+        ]
+        if plato:
+            botones.insert(0, MDFlatButton(text="INSUMOS", on_release=lambda x: self._abrir_gestion_insumos(plato)))
+            botones.insert(0, MDFlatButton(
+                text="ELIMINAR", theme_text_color="Custom", text_color=(0.83, 0.24, 0.24, 1),
+                on_release=lambda x: self._eliminar_plato(plato["id"]),
+            ))
+
+        self.dialog = MDDialog(
+            title="Editar plato" if plato else "Nuevo plato",
+            type="custom", content_cls=content, buttons=botones,
+        )
+        self.dialog.open()
+
+    def _guardar_plato(self):
+        nombre = self.nombre_field.text.strip()
+        try:
+            precio_venta = float(self.precio_field.text or 0)
+            mano_obra = float(self.mano_obra_field.text or 0)
+        except ValueError:
+            return
+        if not nombre:
+            return
+        if self._plato_editando:
+            storage.update_plato(
+                self._plato_editando["id"], nombre, precio_venta, mano_obra, self._imagen_seleccionada
+            )
+        else:
+            storage.add_plato(nombre, precio_venta, mano_obra, self._imagen_seleccionada)
+        self.dialog.dismiss()
+        self.refrescar()
+
+
+    def _abrir_selector_imagen(self):
+        if not self.file_manager:
+            self.file_manager = MDFileManager(
+                exit_manager=lambda *x: self.file_manager.close(),
+                select_path=self._imagen_elegida,
+                preview=True,
+            )
+        self.file_manager.show(os.path.expanduser("~"))
+
+    def _imagen_elegida(self, ruta):
+        self.file_manager.close()
+        if not ruta.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            return
+
+        os.makedirs(IMAGENES_DIR, exist_ok=True)
+        extension = os.path.splitext(ruta)[1]
+        nuevo_nombre = f"{uuid.uuid4().hex}{extension}"
+        destino = os.path.join(IMAGENES_DIR, nuevo_nombre)
+        shutil.copy(ruta, destino)
+
+        self._imagen_seleccionada = destino
+        self.preview_imagen.source = destino
+
+    def _eliminar_plato(self, plato_id):
+        storage.delete_plato(plato_id)
+        self.dialog.dismiss()
+        self.refrescar()
+
+
+    def _abrir_gestion_insumos(self, plato):
+        self.dialog.dismiss()
+        self._plato_editando = plato
+
+        self.lista_insumos_box = MDBoxLayout(orientation="vertical", spacing=dp(6), size_hint_y=None)
+        self.lista_insumos_box.bind(minimum_height=self.lista_insumos_box.setter("height"))
+
+        scroll_insumos = MDScrollView(size_hint_y=1)
+        scroll_insumos.add_widget(self.lista_insumos_box)
+
+        self.cantidad_field = MDTextField(hint_text="Cantidad a usar", input_filter="float")
+        
+        self.selector_insumo_btn = MDFlatButton(
+            text="Elegir insumo", 
+            on_release=self._abrir_selector_insumo,
+            pos_hint={"center_x": 0.5}
+        )
+        
+        self.estado_label = MDLabel(
+            text="", size_hint_y=None, height=dp(24),
+            theme_text_color="Custom", text_color=(0.9, 0.3, 0.3, 1),
+            halign="center"
+        )
+
+        content = MDBoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None, height=dp(420))
+        content.add_widget(MDLabel(text="Insumos actuales:", bold=True, size_hint_y=None, height=dp(24)))
+        content.add_widget(scroll_insumos)
+        content.add_widget(self.selector_insumo_btn)
+        content.add_widget(self.cantidad_field)
+        content.add_widget(self.estado_label)
+        
+        btn_agregar_receta = MDRaisedButton(
+            text="AGREGAR A LA RECETA", 
+            on_release=lambda x: self._agregar_insumo_a_receta(),
+            pos_hint={"center_x": 0.5}
+        )
+        content.add_widget(btn_agregar_receta)
+
+        self.insumos_dialog = MDDialog(
+            title=f"Insumos de: {plato['nombre']}",
+            type="custom", content_cls=content,
+            buttons=[MDFlatButton(text="CERRAR", on_release=lambda x: self._cerrar_gestion_insumos())],
+        )
+        self._refrescar_lista_insumos_receta()
+        self.insumos_dialog.open()
+
+    def _cerrar_gestion_insumos(self):
+        self.insumos_dialog.dismiss()
+        self.refrescar()
+
+    def _refrescar_lista_insumos_receta(self):
+        self.lista_insumos_box.clear_widgets()
+        for rel in storage.get_insumos_de_plato(self._plato_editando["id"]):
+            fila = MDBoxLayout(orientation="horizontal", size_hint_y=None, height=dp(36))
+            fila.add_widget(MDLabel(text=f"{rel['nombre']} — {rel['cantidad']} {rel['unidad']}"))
+            btn = MDIconButton(icon="delete", on_release=lambda x, rel_id=rel["rel_id"]: self._quitar_insumo(rel_id))
+            fila.add_widget(btn)
+            self.lista_insumos_box.add_widget(fila)
+
+    def _abrir_selector_insumo(self, boton):
+        items = [
+            {"text": insumo["nombre"], "viewclass": "OneLineListItem", "on_release": lambda i=insumo: self._seleccionar_insumo(i)}
+            for insumo in storage.get_insumos()
+        ]
+        self.menu = MDDropdownMenu(caller=boton, items=items, width_mult=4)
+        self.menu.open()
+
+    def _seleccionar_insumo(self, insumo):
+        self._insumo_seleccionado = insumo
+        self.selector_insumo_btn.text = insumo["nombre"]
+        self.menu.dismiss()
+
+    def _agregar_insumo_a_receta(self):
+        if not self._insumo_seleccionado:
+            self.estado_label.text_color = (0.9, 0.3, 0.3, 1)
+            self.estado_label.text = "⚠ Toca 'Elegir insumo' y selecciona uno."
+            return
+        try:
+            cantidad = float(self.cantidad_field.text or 0)
+        except ValueError:
+            self.estado_label.text_color = (0.9, 0.3, 0.3, 1)
+            self.estado_label.text = "⚠ La cantidad debe ser un número."
+            return
+        if cantidad <= 0:
+            self.estado_label.text_color = (0.9, 0.3, 0.3, 1)
+            self.estado_label.text = "⚠ Ingresa una cantidad mayor a 0."
+            return
+
+        storage.add_insumo_a_plato(self._plato_editando["id"], self._insumo_seleccionado["id"], cantidad)
+        self.estado_label.text = f"✓ {self._insumo_seleccionado['nombre']} agregado."
+        self.estado_label.text_color = (0.2, 0.8, 0.4, 1)
+        self.cantidad_field.text = ""
+        self.selector_insumo_btn.text = "Elegir insumo"
+        self._insumo_seleccionado = None
+        self._refrescar_lista_insumos_receta()
+
+    def _quitar_insumo(self, rel_id):
+        storage.quitar_insumo_de_plato(rel_id)
+        self._refrescar_lista_insumos_receta()
